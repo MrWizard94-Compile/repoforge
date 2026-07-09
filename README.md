@@ -38,7 +38,7 @@ Lite bootstraps *a* project. **Pro bootstraps your kind of project:**
 - Pre-commit hooks (ruff + black), `--dry-run`, saved defaults, `gh` repo auto-creation with `--create-remote --push`
 - Idempotent by design, ships with its own 23-test suite
 
-**→ Get RepoForge Pro** — link coming with launch week (follow [@wpaistudio](https://x.com/wpaistudio) or check back; launch price $14).
+**→ [Get RepoForge Pro — $14 launch price](https://wpaistudio.gumroad.com/l/repoforge)** (regular $19 after launch week).
 
 ---
 
