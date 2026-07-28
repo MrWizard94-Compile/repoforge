@@ -1,0 +1,19 @@
+RepoForge Pro License v1.0
+Copyright (c) 2026 MrWizard94. All rights reserved.
+
+GRANT. Your purchase grants you a personal, non-exclusive, non-transferable
+license to use, run, and modify RepoForge Pro on any machines you personally
+use, for any purpose — including bootstrapping commercial projects. Projects
+you create WITH RepoForge are entirely yours, with no restriction or
+attribution required.
+
+RESTRICTIONS. You may not redistribute, resell, sublicense, publicly post, or
+include RepoForge Pro (original or modified) in any product, repository,
+template pack, or service where the tool itself is what is being provided.
+Team-wide use requires one license per developer.
+
+NO WARRANTY. RepoForge Pro is provided "as is", without warranty of any kind,
+express or implied. In no event shall the author be liable for any claim,
+damages, or other liability arising from its use.
+
+Questions or team licensing: contact via the store page.

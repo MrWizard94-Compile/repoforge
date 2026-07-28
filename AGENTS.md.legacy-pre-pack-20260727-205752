@@ -1,0 +1,53 @@
+# AGENTS — Project Entry Point (RepoForge)
+
+This file is **Level 4 project law entry only**. It points at the universal
+AGENTS Constitution pack. It does not duplicate the constitution.
+
+**Pack path (relative):** `../QuillForge/AGENTS Constitution/`  
+**Product:** RepoForge Pro — one-command Python project bootstrapper
+
+---
+
+## Binding pack
+
+| Role | Path |
+|------|------|
+| **Constitution (SOUL)** | [../QuillForge/AGENTS Constitution/AGENTS.md](../QuillForge/AGENTS%20Constitution/AGENTS.md) |
+| **Process (SOP)** | [../QuillForge/AGENTS Constitution/SOP.md](../QuillForge/AGENTS%20Constitution/SOP.md) |
+| **Pack identity** | [../QuillForge/AGENTS Constitution/PACK.md](../QuillForge/AGENTS%20Constitution/PACK.md) |
+| **Adopt / move** | [../QuillForge/AGENTS Constitution/ADOPT.md](../QuillForge/AGENTS%20Constitution/ADOPT.md) |
+
+---
+
+## Always load (via pack)
+
+* Pack `AGENTS.md`
+* Pack `SOP.md`
+* Pack `constitution/03-DEFINITION-OF-DONE.md`
+* Pack `standards/ENGINEERING.md`
+* Pack `standards/TESTING.md`
+* Pack `standards/DOCUMENTATION.md`
+
+Then load pack modules per the applicability matrix in pack `AGENTS.md`.
+
+---
+
+## RepoForge-specific notes (Level 4)
+
+* **Language:** Python 3.9+, stdlib-only bootstrapper (`repoforge.py`).
+* **Tests:** `pytest tests/ -v` (no network).
+* **Integration:** RepoForge can attach this constitution to *new* projects via
+  `--constitution`, `--constitution-vendor`, `REPOFORGE_CONSTITUTION`, or
+  auto-discovery of a sibling `QuillForge/AGENTS Constitution` pack.
+* **Quality bar:** Completeness, zero-warning tooling for consumers, and
+  honest dry-run behavior align with `CONST-COMPLETE-001` / `ENG-WARN-001` spirit.
+
+## Verify pack
+
+```powershell
+pwsh -File "../QuillForge/AGENTS Constitution/tools/verify-pack.ps1"
+```
+
+---
+
+_Pointer only — evolve the pack by complete file replacement per constitution rules._
