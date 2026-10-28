@@ -1,7 +1,6 @@
 ---
 title: What my project bootstrapper does that `uv init` doesn't (and why I stopped using cookiecutter)
 tags: python, productivity, devtools, showdev
-cover_image: <upload RepoForgeALT.png and paste the dev.to URL here>
 ---
 
 ## The 20-minute tax
@@ -52,10 +51,11 @@ all three in one command:
 python repoforge.py my-api --profile fastapi --pre-commit --create-remote --push
 ```
 
-Sixty seconds later: venv, curated deps, `src/` layout with a running `/health`
-endpoint, README, license, `pyproject.toml`, a passing pytest suite, ruff+black
-pre-commit hooks, and a private GitHub repo with the first commit already pushed
-(via the `gh` CLI when you have it, plain `remote add` when you don't).
+When the command finishes: venv, separate runtime and development inputs, a
+resolved lock, installable `src/` layout with a running `/health` endpoint,
+README, license, `pyproject.toml`, a behavior test, pinned hooks, and a private
+GitHub repo with the generated-file-only initial commit pushed. Remote creation
+preflights an authenticated `gh` session instead of failing after scaffolding.
 
 ## The constraints I refused to break
 
@@ -72,11 +72,13 @@ one gate that checks reality first.
 ```python
 def write(self, path: Path, content: str, description: str) -> bool:
     """Write a file unless it already exists (respected unless --force)."""
+    path = self.checked_path(path)
     if path.exists() and not self.force:
         self.skipped.append(str(path))
         print(f"  -- {description}: exists, left untouched ({path.name})")
         return False
     print(f"  -> {description}")
+    self.track_for_git(path)
     if not self.dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -86,6 +88,10 @@ def write(self, path: Path, content: str, description: str) -> bool:
 Re-running RepoForge on a project you've customized will never eat your README. It
 tells you what it skipped and moves on. Same for git state: existing repo, existing
 remote, nothing-to-commit - detected, respected, reported.
+
+The current release also stages and commits an exact generated-path list. A file
+the developer had already staged, modified, or left untracked cannot leak into a
+RepoForge commit.
 
 **`--dry-run` that provably touches nothing.** Because every file write and
 subprocess call goes through that one `Runner` object, dry-run isn't a best-effort
@@ -101,7 +107,8 @@ is ten lines of *data*:
 ```python
 "fastapi": Profile(
     description="Web API: FastAPI + Uvicorn + httpx test client, src layout.",
-    packages=("fastapi", "uvicorn[standard]", "pydantic", "httpx", "pytest", "ruff"),
+    runtime_packages=("fastapi", "uvicorn[standard]", "pydantic"),
+    development_packages=("httpx2", "pytest", "ruff"),
     src_layout=True,
 ),
 ```
@@ -124,7 +131,7 @@ because it's not a guess about how research should work - it's scar tissue.
 
 ## What testing your own tool teaches you
 
-RepoForge ships with its own 23-test pytest suite, and writing it was humbling in the
+RepoForge ships with its full behavior and release-integrity pytest suite, and writing it was humbling in the
 specific way testing always is. The pure functions were fine. The lies were all in the
 seams: the idempotency guarantees I *believed* I had implemented versus the ones the
 integration test could actually demonstrate. The test that builds a real repo, edits

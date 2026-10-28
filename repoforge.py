@@ -2,17 +2,16 @@
 """
 RepoForge Pro — the opinionated Python project bootstrapper.
 
-One command turns an empty directory into a working, git-connected Python project:
-virtual environment, curated dependencies for your project *type*, .gitignore,
-README, LICENSE, pyproject.toml, a passing test, optional pre-commit hooks,
-optional AGENTS Constitution pack integration, and a GitHub remote (created for
-you when the `gh` CLI is available).
+One command turns an empty directory into a working, git-connected Python project
+foundation: virtual environment, curated dependencies for your project *type*,
+.gitignore, README, LICENSE, installable packaging, meaningful smoke tests,
+optional pre-commit hooks, a canonical WPAI Constitution pointer, and a
+GitHub remote (created for you with an authenticated `gh` CLI).
 
     python repoforge.py my-tool --profile cli
     python repoforge.py my-api --profile fastapi --license mit --pre-commit
     python repoforge.py lab-01 --profile ml-experiment --skip-install
-    python repoforge.py my-tool --constitution ../QuillForge/AGENTS Constitution
-    python repoforge.py my-tool --constitution PATH --constitution-vendor
+    python repoforge.py my-tool --no-constitution  # explicit governance opt-out
     python repoforge.py --list-profiles
     python repoforge.py my-tool --dry-run          # show the plan, touch nothing
 
@@ -20,9 +19,9 @@ Design principles:
   * Idempotent — safe to re-run in the same directory; existing files are never
     overwritten (see --force), existing git state is detected and respected.
   * Honest output — every action is announced; --dry-run prints the full plan.
-  * Zero dependencies — standard library only, Python 3.9+.
-  * Constitution-aware — optional pointer (or vendored pack) to the universal
-    AGENTS Constitution for human–AI engineering standards.
+  * Zero dependencies — standard library only, Python 3.10+.
+  * Constitution-aware — a pointer to accepted WPAI Constitution, never an
+    editable law copy or an automatically discovered local pack.
 
 Copyright (c) 2026 MrWizard94. Sold under the RepoForge Pro license (LICENSE.txt).
 """
@@ -31,78 +30,120 @@ from __future__ import annotations
 
 import argparse
 import json
+import keyword
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 __version__ = "1.1.0"
+MINIMUM_PYTHON = (3, 10)
+PRE_COMMIT_REQUIREMENT = "pre-commit==4.6.2"
 
 CONFIG_PATH = Path.home() / ".repoforge.json"
+CONFIG_KEYS = frozenset({"owner", "author", "license", "profile"})
+RETIRED_CONFIG_KEY = "constitution_path"
+MAX_CONFIG_BYTES = 64 * 1024
 
-# Relative path used when the constitution pack is vendored into a new project.
-VENDORED_CONSTITUTION_DIR = Path("law") / "AGENTS-Constitution"
-
-# Marker files that identify a valid AGENTS Constitution pack root (PACK.md).
-CONSTITUTION_MARKERS = ("AGENTS.md", "PACK.md", "VERSION", "SOP.md")
+CONSTITUTION_SOURCE = "https://github.com/MrWizard94-Compile/Agents-Constitution"
+REMOTE_URL_PREFIXES = ("https://", "http://", "ssh://", "git://", "git@")
+GITHUB_SLUG_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+WINDOWS_RESERVED_NAMES = {
+    "aux",
+    "clock$",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 
 
 # --------------------------------------------------------------------------- #
 # Profiles — curated dependency sets and scaffolding per project type.        #
 # --------------------------------------------------------------------------- #
 
+
 @dataclass(frozen=True)
 class Profile:
     """A project archetype: what it needs and what it looks like on day one."""
 
     description: str
-    packages: Tuple[str, ...]
+    runtime_packages: tuple[str, ...]
+    development_packages: tuple[str, ...]
     # Directories created relative to the project root.
-    dirs: Tuple[str, ...] = ()
+    dirs: tuple[str, ...] = ()
+    # Workspace directories whose generated contents stay out of Git by default.
+    ignored_dirs: tuple[str, ...] = ()
     # Extra files: relative path -> content factory name (resolved in scaffold_extras).
-    extras: Tuple[str, ...] = ()
+    extras: tuple[str, ...] = ()
     # Whether to scaffold a src/<package>/ layout with an entry module.
     src_layout: bool = False
 
+    @property
+    def packages(self) -> tuple[str, ...]:
+        """All direct dependencies, retained as a convenient public view."""
+        return self.runtime_packages + self.development_packages
 
-PROFILES: Dict[str, Profile] = {
+
+PROFILES: dict[str, Profile] = {
     "minimal": Profile(
         description="Just the essentials: venv, git, pytest. No opinions.",
-        packages=("pytest",),
+        runtime_packages=(),
+        development_packages=("pytest",),
     ),
     "general": Profile(
         description="Everyday scripting: HTTP, env files, terminal output, linting.",
-        packages=("requests", "python-dotenv", "rich", "pytest", "ruff", "black"),
+        runtime_packages=("requests", "python-dotenv", "rich"),
+        development_packages=("pytest", "ruff", "black"),
     ),
     "cli": Profile(
         description="Command-line tool with Typer + Rich, src layout, entry point.",
-        packages=("typer", "rich", "pytest", "ruff", "black"),
+        runtime_packages=("typer", "rich"),
+        development_packages=("pytest", "ruff", "black"),
         src_layout=True,
     ),
     "fastapi": Profile(
-        description="Web API: FastAPI + Uvicorn + httpx test client, src layout.",
-        packages=("fastapi", "uvicorn[standard]", "pydantic", "httpx", "pytest", "ruff"),
+        description="Web API: FastAPI + Uvicorn + HTTPX2 test client, src layout.",
+        runtime_packages=(
+            "fastapi",
+            "uvicorn[standard]",
+            "pydantic",
+            # 2026-09-09: Starlette 1.6.0 still imports an alias deprecated in
+            # AnyIO 4.15; this ceiling keeps warnings-as-errors clean.
+            "anyio>=4.14.2,<4.15",
+        ),
+        development_packages=("httpx2", "pytest", "ruff"),
         src_layout=True,
     ),
     "data": Profile(
         description="Data analysis: NumPy, pandas, Matplotlib, Jupyter kernel.",
-        packages=("numpy", "pandas", "matplotlib", "ipykernel", "pytest"),
+        runtime_packages=("numpy", "pandas", "matplotlib", "ipykernel"),
+        development_packages=("pytest",),
         dirs=("data", "notebooks", "output"),
+        ignored_dirs=("data", "output"),
     ),
     "ml-experiment": Profile(
         description="Disciplined AI/ML research: experiment + claims registries, "
-                    "results/plots layout, measured-iteration workflow.",
-        packages=("numpy", "matplotlib", "pytest"),
+        "results/plots layout, measured-iteration workflow.",
+        runtime_packages=("numpy", "matplotlib"),
+        development_packages=("pytest",),
         dirs=("experiments", "results", "plots", "references"),
+        ignored_dirs=("results", "plots"),
         extras=("EXPERIMENT_LOG.md", "CLAIMS.md"),
     ),
     "automation": Profile(
         description="Scrapers and scheduled jobs: requests, BeautifulSoup, dotenv.",
-        packages=("requests", "beautifulsoup4", "python-dotenv", "schedule", "pytest"),
+        runtime_packages=("requests", "beautifulsoup4", "python-dotenv", "schedule"),
+        development_packages=("pytest",),
         dirs=("logs",),
+        ignored_dirs=("logs",),
     ),
 }
 
@@ -111,16 +152,40 @@ PROFILES: Dict[str, Profile] = {
 # Execution engine — every mutation goes through here so --dry-run is total.  #
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class Runner:
     """Executes commands and writes files, honouring --dry-run and --force."""
 
     dry_run: bool = False
     force: bool = False
-    skipped: List[str] = field(default_factory=list)
+    root: Path | None = None
+    skipped: list[str] = field(default_factory=list)
+    stage_paths: list[Path] = field(default_factory=list)
 
-    def run(self, command: List[str], description: str, cwd: Path,
-            fatal: bool = True) -> bool:
+    def checked_path(self, path: Path) -> Path:
+        """Return a path confined to the configured project root."""
+        if self.root is None:
+            return path
+        root = self.root.resolve()
+        candidate = path.resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                f"Refusing to write outside the project directory: {path}"
+            ) from error
+        return path
+
+    def track_for_git(self, path: Path) -> None:
+        """Record a generated path for precise staging later in the run."""
+        checked = self.checked_path(path)
+        if checked not in self.stage_paths:
+            self.stage_paths.append(checked)
+
+    def run(
+        self, command: list[str], description: str, cwd: Path, fatal: bool = True
+    ) -> bool:
         """Run a subprocess; on failure either exit (fatal) or report and continue."""
         print(f"  -> {description}")
         if self.dry_run:
@@ -138,24 +203,45 @@ class Runner:
             message = f"'{command[0]}' is not installed or not on PATH."
             self._fail(description, message, fatal)
             return False
+
+    def capture(
+        self, command: list[str], description: str, cwd: Path, fatal: bool = True
+    ) -> str | None:
+        """Run a command and return stdout while preserving dry-run semantics."""
+        print(f"  -> {description}")
+        if self.dry_run:
+            print(f"     [dry-run] {' '.join(command)}")
+            return None
+        try:
+            result = subprocess.run(
+                command, cwd=str(cwd), check=True, text=True, capture_output=True
+            )
+            return result.stdout
+        except FileNotFoundError:
+            message = f"'{command[0]}' is not installed or not on PATH."
+            self._fail(description, message, fatal)
+            return None
         except subprocess.CalledProcessError as error:
             message = (error.stderr or error.stdout or "").strip()
             self._fail(description, message, fatal)
-            return False
+            return None
 
     def write(self, path: Path, content: str, description: str) -> bool:
         """Write a file unless it already exists (respected unless --force)."""
+        path = self.checked_path(path)
         if path.exists() and not self.force:
             self.skipped.append(str(path))
             print(f"  -- {description}: exists, left untouched ({path.name})")
             return False
         print(f"  -> {description}")
+        self.track_for_git(path)
         if not self.dry_run:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
         return True
 
     def mkdir(self, path: Path, description: str) -> None:
+        path = self.checked_path(path)
         if path.exists():
             return
         print(f"  -> {description}")
@@ -175,27 +261,55 @@ class Runner:
 # Pure helpers — unit-testable, no side effects.                              #
 # --------------------------------------------------------------------------- #
 
-def build_remote_url(repo_name: Optional[str], repo_url: Optional[str],
-                     owner: Optional[str]) -> Optional[str]:
+
+def build_remote_url(
+    repo_name: str | None, repo_url: str | None, owner: str | None
+) -> str | None:
     """Resolve the remote URL from a slug, owner/slug pair, or full URL.
 
     Returns None when no remote is wanted (no name and no URL given).
     """
-    if repo_url:
-        return repo_url
+    if repo_url is not None:
+        cleaned_url = repo_url.strip()
+        if not cleaned_url:
+            raise ValueError("--repo-url cannot be blank")
+        return cleaned_url
     if not repo_name:
         return None
     slug = repo_name.strip()
-    if slug.startswith(("https://", "http://", "git@")):
+    if not slug:
+        raise ValueError("Repository name cannot be blank")
+    if slug.startswith(REMOTE_URL_PREFIXES):
         return slug
     if "/" in slug:
+        if GITHUB_SLUG_PATTERN.fullmatch(slug) is None:
+            raise ValueError(
+                "GitHub repository names must use the form owner/repository"
+            )
         return f"https://github.com/{slug}.git"
     if not owner:
         raise ValueError(
             "A bare repo name needs a GitHub owner. Pass --owner YOUR_NAME "
             "(and --save-defaults to remember it) or use owner/name form."
         )
-    return f"https://github.com/{owner}/{slug}.git"
+    github_slug = f"{owner.strip()}/{slug}"
+    if GITHUB_SLUG_PATTERN.fullmatch(github_slug) is None:
+        raise ValueError("GitHub owner and repository names contain invalid characters")
+    return f"https://github.com/{github_slug}.git"
+
+
+def github_slug_from_remote(remote_url: str) -> str | None:
+    """Return ``owner/repo`` for a supported GitHub HTTPS or SSH remote."""
+    patterns = (
+        r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+        r"^git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$",
+        r"^ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, remote_url)
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    return None
 
 
 def package_name_from(project_name: str) -> str:
@@ -203,239 +317,168 @@ def package_name_from(project_name: str) -> str:
     name = re.sub(r"[^0-9a-zA-Z_]+", "_", project_name.strip().lower()).strip("_")
     if not name:
         name = "app"
-    if name[0].isdigit():
+    if (
+        name[0].isdigit()
+        or keyword.iskeyword(name)
+        or name.casefold() in WINDOWS_RESERVED_NAMES
+    ):
         name = f"app_{name}"
     return name
 
 
 def venv_python(venv_dir: Path) -> Path:
     """Path to the venv's Python interpreter, cross-platform."""
-    if sys.platform == "win32":
+    if os.name == "nt":
         return venv_dir / "Scripts" / "python.exe"
     return venv_dir / "bin" / "python"
 
 
-def load_defaults() -> Dict[str, str]:
+def load_defaults() -> dict[str, str]:
     """Read saved defaults from ~/.repoforge.json (missing/corrupt -> empty)."""
     try:
+        if CONFIG_PATH.stat().st_size > MAX_CONFIG_BYTES:
+            return {}
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            key: value
+            for key, value in data.items()
+            if (key in CONFIG_KEYS or key == RETIRED_CONFIG_KEY)
+            and isinstance(value, str)
+            and value
+        }
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def save_defaults(values: Dict[str, str]) -> None:
-    merged = {**load_defaults(), **{k: v for k, v in values.items() if v}}
-    CONFIG_PATH.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+def save_defaults(values: Mapping[str, str | None], *, dry_run: bool = False) -> None:
+    """Atomically merge saved defaults, or only describe the write in dry-run mode."""
+    merged = {
+        **load_defaults(),
+        **{key: value for key, value in values.items() if value},
+    }
+    merged = {key: value for key, value in merged.items() if key in CONFIG_KEYS}
+    if dry_run:
+        print(f"  -> Would save defaults to {CONFIG_PATH} [dry-run]")
+        return
+
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{CONFIG_PATH.name}.",
+            suffix=".tmp",
+            dir=CONFIG_PATH.parent,
+            delete=False,
+        ) as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        if os.name != "nt":
+            temporary_path.chmod(0o600)
+        temporary_path.replace(CONFIG_PATH)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     print(f"  -> Saved defaults to {CONFIG_PATH}")
 
 
 # --------------------------------------------------------------------------- #
-# AGENTS Constitution integration (universal portable pack).                  #
+# WPAI Constitution integration — pointers only, no local law discovery.       #
 # --------------------------------------------------------------------------- #
 
-def is_constitution_pack(path: Path) -> bool:
-    """True when *path* looks like an AGENTS Constitution pack root."""
-    if not path.is_dir():
-        return False
-    return all((path / marker).is_file() for marker in CONSTITUTION_MARKERS)
 
-
-def discover_constitution_pack(
-    explicit: Optional[str] = None,
-    *,
-    start: Optional[Path] = None,
-) -> Optional[Path]:
-    """Resolve a constitution pack path.
-
-    Order:
-      1. *explicit* argument (CLI ``--constitution``)
-      2. Environment variable ``REPOFORGE_CONSTITUTION``
-      3. ``constitution_path`` in ``~/.repoforge.json``
-      4. Auto-discover near *start* (default: this file's parent and parents):
-         folders named ``AGENTS Constitution`` / ``AGENTS-Constitution`` that
-         pass :func:`is_constitution_pack`, and sibling trees under common
-         monorepo layouts (e.g. ``../QuillForge/AGENTS Constitution``).
-    """
-    candidates: List[Path] = []
-
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    env = __import__("os").environ.get("REPOFORGE_CONSTITUTION")
-    if env:
-        candidates.append(Path(env).expanduser())
-    saved = load_defaults().get("constitution_path")
-    if saved:
-        candidates.append(Path(saved).expanduser())
-
-    for raw in candidates:
-        resolved = raw.resolve()
-        if is_constitution_pack(resolved):
-            return resolved
-
-    # Auto-discovery only when nothing explicit failed (or nothing given).
-    if explicit or env or saved:
-        # Caller asked for a specific path that was invalid — return None so
-        # the CLI can report an honest error rather than silently searching.
-        if explicit or env:
-            return None
-
-    root = (start or Path(__file__).resolve().parent).resolve()
-    search_roots = [root, *root.parents]
-    names = ("AGENTS Constitution", "AGENTS-Constitution", "agents-constitution")
-    for base in search_roots[:6]:
-        for name in names:
-            candidate = (base / name).resolve()
-            if is_constitution_pack(candidate):
-                return candidate
-        # Sibling monorepo: Software/QuillForge/AGENTS Constitution
-        sibling = (base / "QuillForge" / "AGENTS Constitution").resolve()
-        if is_constitution_pack(sibling):
-            return sibling
-        sibling_alt = (base / "QuillForge" / "AGENTS-Constitution").resolve()
-        if is_constitution_pack(sibling_alt):
-            return sibling_alt
-    return None
-
-
-def relative_pack_path(from_dir: Path, pack_root: Path) -> str:
-    """POSIX-style relative path from *from_dir* to *pack_root* for markdown links."""
-    try:
-        rel = Path(os_path_relpath(pack_root, from_dir))
-    except ValueError:
-        # Different drives on Windows — fall back to absolute POSIX-ish path.
-        return pack_root.resolve().as_posix()
-    return rel.as_posix()
-
-
-def os_path_relpath(path: Path, start: Path) -> str:
-    """os.path.relpath wrapper (keeps stdlib-only footprint)."""
-    import os
-    return os.path.relpath(str(path.resolve()), str(start.resolve()))
-
-
-def agents_pointer_content(project: str, pack_rel: str) -> str:
-    """Level-4 project AGENTS.md pointer into a constitution pack."""
-    # Ensure trailing slash for directory-style links in docs.
-    pack = pack_rel.rstrip("/")
-    return f"""\
-# AGENTS — Project Entry Point ({project})
-
-This file is **Level 4 project law entry only**. It points at the universal
-AGENTS Constitution pack. It does not duplicate the constitution.
-
-**Pack path (relative):** `{pack}/`
-**Bootstrapped by:** RepoForge v{__version__}
-
----
-
-## Binding pack
-
-| Role | Path |
-|------|------|
-| **Constitution (SOUL)** | [{pack}/AGENTS.md]({pack}/AGENTS.md) |
-| **Process (SOP)** | [{pack}/SOP.md]({pack}/SOP.md) |
-| **Pack identity** | [{pack}/PACK.md]({pack}/PACK.md) |
-| **Adopt / move** | [{pack}/ADOPT.md]({pack}/ADOPT.md) |
-| **Integrity** | [{pack}/INTEGRITY.md]({pack}/INTEGRITY.md) |
-
----
-
-## Always load (via pack)
-
-* Pack `AGENTS.md`
-* Pack `SOP.md`
-* Pack `constitution/03-DEFINITION-OF-DONE.md`
-* Pack `standards/ENGINEERING.md`
-* Pack `standards/TESTING.md`
-* Pack `standards/DOCUMENTATION.md`
-
-Then load pack modules per the applicability matrix in pack `AGENTS.md`.
-
----
-
-## Verify pack
-
-```bash
-# From pack root (PowerShell)
-pwsh -File "{pack}/tools/verify-pack.ps1"
-```
-
-Must exit `0` after pack install, move, or update.
-
----
-
-## Project-local law (Level 4)
-
-* README / product docs in this repository
-* Architecture notes and ADRs as the project grows
-* Overrides: pack `templates/PROJECT-OVERRIDE.template.md`
-
-Project law may **tighten** standards. It may not weaken `CONST-*`,
-`ENG-WARN-001`, `TEST-BEHAVIOR-001`, or `SEC-INPUT-001` without a documented
-override.
-
----
-
-_Generated by RepoForge — edit freely; keep the pack pointer accurate if the pack moves._
-"""
-
-
-def copy_constitution_pack(runner: Runner, source: Path, dest: Path) -> None:
-    """Copy a constitution pack tree into *dest* (skips reports/ and _archive_*)."""
-    if dest.exists() and not runner.force:
-        print(f"  -- Constitution pack already present at {dest}, leaving it")
-        runner.skipped.append(str(dest))
-        return
-    print(f"  -> Vendoring AGENTS Constitution pack -> {dest}")
-    if runner.dry_run:
-        print(f"     [dry-run] copytree {source} -> {dest}")
-        return
-    if dest.exists() and runner.force:
-        shutil.rmtree(dest)
-    ignore = shutil.ignore_patterns(
-        "reports", "_archive*", "__pycache__", ".pytest_cache", "*.pyc"
-    )
-    shutil.copytree(source, dest, ignore=ignore)
-
-
-def setup_constitution(
-    runner: Runner,
-    target: Path,
-    project: str,
-    pack_root: Optional[Path],
+def validate_constitution_options(
+    explicit: str | None,
     *,
     vendor: bool,
     enabled: bool,
+    saved_path: str | None,
 ) -> None:
-    """Attach AGENTS Constitution to a bootstrapped project."""
-    if not enabled:
-        print("  -- AGENTS Constitution skipped (--no-constitution)")
-        return
-    if pack_root is None:
-        print("  -- AGENTS Constitution pack not found "
-              "(pass --constitution PATH, set REPOFORGE_CONSTITUTION, "
-              "or save constitution_path via --save-defaults)")
-        return
-    if not is_constitution_pack(pack_root):
-        print(f"  !! Not a valid constitution pack: {pack_root}")
-        print("     Need AGENTS.md, PACK.md, VERSION, SOP.md at pack root.")
-        return
-
-    print(f"  -> AGENTS Constitution: {pack_root}")
+    """Reject retired selectors before configuration or project mutations."""
     if vendor:
-        dest = target / VENDORED_CONSTITUTION_DIR
-        runner.mkdir(dest.parent, f"Creating {dest.parent.as_posix()}/")
-        copy_constitution_pack(runner, pack_root, dest)
-        pack_rel = VENDORED_CONSTITUTION_DIR.as_posix()
-    else:
-        pack_rel = relative_pack_path(target, pack_root)
+        raise ValueError(
+            "--constitution-vendor is retired; RepoForge writes a canonical "
+            "WPAI Constitution pointer, never editable law. Remove the flag; "
+            "use --no-constitution to opt out."
+        )
+    if explicit is not None:
+        raise ValueError(
+            "--constitution PATH is retired; RepoForge writes a canonical "
+            "WPAI Constitution pointer without a local pack. Remove the option; "
+            "use --no-constitution to opt out."
+        )
+    if enabled and (os.environ.get("REPOFORGE_CONSTITUTION") or saved_path):
+        raise ValueError(
+            "Local constitution path settings are retired in pointer-only mode. "
+            "Unset REPOFORGE_CONSTITUTION and remove constitution_path from "
+            "~/.repoforge.json, or pass --no-constitution to opt out. "
+            "--no-constitution --save-defaults explicitly retires the saved key."
+        )
 
-    runner.write(
+
+def agents_pointer_content() -> str:
+    """Render a stable loader, not law or a claim of verified acceptance."""
+    return f"""\
+# Project agent entry
+
+The accepted `main` of
+[WPAI Constitution]({CONSTITUTION_SOURCE})
+is the sole editable source of constitutional law. This project file is a
+pointer and product-context entry, not a second constitution.
+Bootstrapped by RepoForge v{__version__}.
+
+## Load and verify
+
+Use the installed `wpai-constitution` skill. Resolve and record one verified
+accepted full commit SHA for the invocation. Read `SKILL.md`, `SOURCE.json`,
+`references/always-load.md` and all named/applicable law from that same frozen
+revision. Verify source identity and file hashes against its manifest.
+Do not treat a nearby folder, archived pack or generated mirror as fresh law;
+mirrors are distributions, not authority.
+
+If GitHub is unavailable, follow only the fallback permitted by the frozen
+skill: a previously verified generated mirror with matching provenance and
+file hashes. Disclose degraded synchronization and the frozen revision; do not
+claim freshness. If no permitted verified source is available, report that
+limitation before governed work instead of substituting local law.
+
+## Product context and authority
+
+Read this project's README, declared stack and commands, architecture,
+acceptance criteria and data boundaries before acting. Keep product facts here
+or in project docs, and amendments in canonical PRs rather than copied law.
+
+This pointer does not grant human authorization to commit, push, publish,
+spend, distribute, delete or change scope. Obtain the authority required for
+the requested action. RepoForge does not download law, install the skill,
+verify accepted GitHub state or invoke agents. Creating this file alone does
+not prove an installed agent loaded it or a project passed delivery gates.
+"""
+
+
+def setup_constitution(runner: Runner, target: Path, *, enabled: bool) -> bool:
+    """Write the canonical pointer, honestly reporting preserved user guidance."""
+    if not enabled:
+        print("  -- WPAI Constitution skipped (--no-constitution)")
+        return False
+    installed = runner.write(
         target / "AGENTS.md",
-        agents_pointer_content(project, pack_rel),
-        "Writing AGENTS.md (constitution project pointer)",
+        agents_pointer_content(),
+        "Writing AGENTS.md (canonical WPAI Constitution pointer)",
     )
+    if not installed:
+        print(
+            "  -- Existing AGENTS.md preserved; canonical pointer was not installed. "
+            "Its authority is not verified. Review and migrate it explicitly."
+        )
+    return installed
 
 
 # --------------------------------------------------------------------------- #
@@ -501,20 +544,22 @@ PRE_COMMIT_CONFIG = """\
 # Refresh hook versions any time with `pre-commit autoupdate`.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.4
+    rev: v0.16.6
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
-  - repo: https://github.com/psf/black
-    rev: 24.4.2
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.5.1
     hooks:
       - id: black
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v6.0.0
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
 """
 
 EXPERIMENT_LOG = """\
@@ -525,15 +570,15 @@ EXPERIMENT_LOG = """\
 
 | ID | Date | Hypothesis tested | Config / seed | Result (measured) | Verdict |
 |----|------|-------------------|---------------|-------------------|---------|
-| EXP-001 | {date} | _e.g. "X improves Y by >10% on Z"_ | | | pending |
 
-## EXP-001 — <title>
+## Entry contract
 
-**Hypothesis:** <falsifiable claim>
-**Setup:** <exact command / config / seed>
-**Result:** <numbers, not adjectives>
-**Verdict:** supported / falsified / inconclusive
-**Next:** <what this changes about EXP-002>
+- Assign the next sequential `EXP-NNN` identifier and record the run date.
+- State one measurable, falsifiable hypothesis before execution.
+- Preserve the exact command, configuration, data identity, and random seed.
+- Record measured results with units and the supported, falsified, or
+  inconclusive verdict.
+- Explain how the result changes the next experiment.
 """
 
 CLAIMS_REGISTRY = """\
@@ -545,12 +590,15 @@ CLAIMS_REGISTRY = """\
 
 | Claim | Class | Evidence (experiment IDs) | Falsification condition |
 |-------|-------|---------------------------|-------------------------|
-| | Working Hypothesis | | |
+
+Add a claim only when its class, evidence references, and falsification condition
+are explicit. Keep falsified claims as durable negative evidence.
 """
 
 
-def readme_content(project: str, profile_name: str, profile: Profile,
-                   package: str) -> str:
+def readme_content(
+    project: str, profile_name: str, profile: Profile, package: str
+) -> str:
     run_hint = {
         "cli": f"python -m {package} --help",
         "fastapi": f"uvicorn {package}.main:app --reload",
@@ -558,7 +606,8 @@ def readme_content(project: str, profile_name: str, profile: Profile,
     return f"""\
 # {project}
 
-<!-- One sentence: what this project does and for whom. -->
+`{project}` is a runnable `{profile_name}` Python project foundation generated by
+RepoForge. Extend the working entry point with the product's domain behavior.
 
 ## Quickstart
 
@@ -568,7 +617,11 @@ def readme_content(project: str, profile_name: str, profile: Profile,
 # macOS / Linux
 source .venv/bin/activate
 
-pip install -r requirements.txt
+# Use the resolved lock when present (normal RepoForge run).
+python -m pip install -r requirements.lock
+# If setup intentionally skipped installation and no lock exists, use:
+# python -m pip install -r requirements-dev.txt
+python -m pip install --no-deps --editable .
 {run_hint}
 ```
 
@@ -580,56 +633,118 @@ pytest
 
 ## Project layout
 
-Bootstrapped with [RepoForge](https://github.com/) using the `{profile_name}` profile:
+Bootstrapped with RepoForge v{__version__} using the `{profile_name}` profile:
 {profile.description}
+
+`requirements.txt` records direct runtime inputs. `requirements-dev.txt` adds
+development tools. A normal RepoForge run also writes `requirements.lock` from
+the resolved environment; keep that file to reproduce the validated dependency set.
 
 ## Engineering standards
 
-If this project includes an `AGENTS.md` pointer, it links to the universal
-**AGENTS Constitution** pack (quality law + SOP). Load that pack for AI-assisted
-work; run the pack's `tools/verify-pack.ps1` after moving the pack.
+If this project includes an `AGENTS.md` pointer, use the installed
+`wpai-constitution` skill to freeze and verify accepted
+[WPAI Constitution]({CONSTITUTION_SOURCE}) for AI-assisted work. Law is not
+copied into this project. Follow only the skill's permitted verified offline
+fallback when GitHub is unavailable; pointer creation is not runtime acceptance.
 
 ---
 _Generated by RepoForge v{__version__} — edit freely, this file is yours._
 """
 
 
-def pyproject_content(project: str, package: str) -> str:
+def toml_array(values: tuple[str, ...]) -> str:
+    """Render a compact TOML string array from trusted profile values."""
+    return "[" + ", ".join(json.dumps(value) for value in values) + "]"
+
+
+def pyproject_content(
+    project: str, package: str, profile_name: str, profile: Profile
+) -> str:
+    description = json.dumps(
+        f"Runnable {profile_name} Python foundation for {project}", ensure_ascii=False
+    )
+    packaging = (
+        '[tool.setuptools]\npackage-dir = {"" = "src"}\n\n'
+        '[tool.setuptools.packages.find]\nwhere = ["src"]\n'
+        if profile.src_layout
+        else '[tool.setuptools]\npy-modules = ["main"]\n'
+    )
+    script = (
+        f'\n[project.scripts]\n{package} = "{package}.__main__:app"\n'
+        if profile_name == "cli"
+        else ""
+    )
     return f"""\
+[build-system]
+requires = ["setuptools>=80,<81"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "{package}"
 version = "0.1.0"
-description = ""
-requires-python = ">=3.9"
-
+description = {description}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = {toml_array(profile.runtime_packages)}
+{script}
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
 
 [tool.black]
 line-length = 100
-"""
+target-version = ["py310"]
+
+{packaging}"""
 
 
-def sample_test_content(package: str, src_layout: bool) -> str:
-    if src_layout:
+def sample_test_content(package: str, profile_name: str) -> str:
+    if profile_name == "cli":
         return f"""\
-\"\"\"Smoke test — proves the package imports and pytest is wired up.\"\"\"
+\"\"\"Behavior test for the generated command-line entry point.\"\"\"
 
-import {package}
+from typer.testing import CliRunner
+
+from {package}.__main__ import app
 
 
-def test_package_imports():
-    assert {package} is not None
+runner = CliRunner()
+
+
+def test_status_command_reports_ready():
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "{package} is ready"
+"""
+    if profile_name == "fastapi":
+        return f"""\
+\"\"\"Behavior test for the generated health endpoint.\"\"\"
+
+from fastapi.testclient import TestClient
+
+from {package}.main import app
+
+
+def test_health_endpoint():
+    response = TestClient(app).get("/health")
+    assert response.status_code == 200
+    assert response.json() == {{"status": "ok"}}
 """
     return """\
-\"\"\"Smoke test — proves pytest is wired up. Replace with real tests.\"\"\"
+\"\"\"Behavior test for the generated project status entry point.\"\"\"
+
+import main
 
 
-def test_truth():
-    assert True
+def test_project_status_reports_ready():
+    assert main.project_status()["status"] == "ready"
 """
 
 
@@ -640,13 +755,18 @@ def entry_module_content(profile_name: str, package: str) -> str:
 
 import typer
 
-app = typer.Typer(help="{package} command-line tool")
+app = typer.Typer(help="{package} command-line tool", no_args_is_help=True)
+
+
+@app.callback()
+def main() -> None:
+    \"\"\"Run {package} commands.\"\"\"
 
 
 @app.command()
-def hello(name: str = "world") -> None:
-    \"\"\"Example command — replace with your own.\"\"\"
-    typer.echo(f"Hello, {{name}}!")
+def status() -> None:
+    \"\"\"Confirm that the generated command-line foundation is operational.\"\"\"
+    typer.echo("{package} is ready")
 
 
 if __name__ == "__main__":
@@ -666,222 +786,615 @@ def health() -> dict:
 """
 
 
+def main_module_content(project: str, profile_name: str) -> str:
+    """Create a complete, testable entry point for non-src project profiles."""
+    project_literal = json.dumps(project)
+    profile_literal = json.dumps(profile_name)
+    return f'''\
+"""Generated project entry point."""
+
+
+def project_status() -> dict[str, str]:
+    """Return stable bootstrap metadata for health checks and tests."""
+    return {{
+        "project": {project_literal},
+        "profile": {profile_literal},
+        "status": "ready",
+    }}
+
+
+def main() -> None:
+    """Print a concise operational status."""
+    status = project_status()
+    print(f"{{status['project']}} [{{status['profile']}}] is {{status['status']}}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
 # --------------------------------------------------------------------------- #
 # Setup phases.                                                               #
 # --------------------------------------------------------------------------- #
 
-def scaffold_project(runner: Runner, target: Path, project: str,
-                     profile_name: str, license_choice: str, author: str) -> None:
-    import datetime
 
+def scaffold_project(
+    runner: Runner,
+    target: Path,
+    project: str,
+    profile_name: str,
+    license_choice: str,
+    author: str,
+    pre_commit: bool = False,
+) -> None:
     profile = PROFILES[profile_name]
     package = package_name_from(project)
 
     runner.write(target / ".gitignore", GITIGNORE, "Writing .gitignore")
-    runner.write(target / "requirements.txt",
-                 "\n".join(profile.packages) + "\n",
-                 f"Writing requirements.txt ({profile_name}: "
-                 f"{len(profile.packages)} packages)")
-    runner.write(target / "README.md",
-                 readme_content(project, profile_name, profile, package),
-                 "Writing README.md")
-    runner.write(target / "pyproject.toml", pyproject_content(project, package),
-                 "Writing pyproject.toml")
+    runner.write(
+        target / "requirements.txt",
+        "\n".join(profile.runtime_packages)
+        + ("\n" if profile.runtime_packages else ""),
+        f"Writing requirements.txt ({profile_name}: "
+        f"{len(profile.runtime_packages)} runtime packages)",
+    )
+    development_packages = list(profile.development_packages)
+    if pre_commit:
+        development_packages.append(PRE_COMMIT_REQUIREMENT)
+    runner.write(
+        target / "requirements-dev.txt",
+        "-r requirements.txt\n" + "\n".join(development_packages) + "\n",
+        f"Writing requirements-dev.txt ({len(development_packages)} "
+        "development packages)",
+    )
+    runner.write(
+        target / "README.md",
+        readme_content(project, profile_name, profile, package),
+        "Writing README.md",
+    )
+    runner.write(
+        target / "pyproject.toml",
+        pyproject_content(project, package, profile_name, profile),
+        "Writing pyproject.toml",
+    )
 
     if license_choice == "mit":
-        runner.write(target / "LICENSE",
-                     MIT_LICENSE.format(year=datetime.date.today().year,
-                                        author=author or "the author"),
-                     "Writing LICENSE (MIT)")
+        runner.write(
+            target / "LICENSE",
+            MIT_LICENSE.format(
+                year=datetime.now(timezone.utc).year, author=author or "the author"
+            ),
+            "Writing LICENSE (MIT)",
+        )
 
     for directory in profile.dirs:
         runner.mkdir(target / directory, f"Creating {directory}/")
+        ignored = directory in profile.ignored_dirs
+        marker = ".gitignore" if ignored else ".gitkeep"
+        content = "*\n!.gitignore\n" if ignored else ""
+        runner.write(
+            target / directory / marker,
+            content,
+            f"Preserving {directory}/ in Git"
+            + (" while ignoring generated contents" if ignored else ""),
+        )
 
     if profile.src_layout:
         pkg_dir = target / "src" / package
-        runner.write(pkg_dir / "__init__.py",
-                     f'"""{package} package."""\n\n__version__ = "0.1.0"\n',
-                     f"Creating src/{package}/__init__.py")
+        runner.write(
+            pkg_dir / "__init__.py",
+            f'"""{package} package."""\n\n__version__ = "0.1.0"\n',
+            f"Creating src/{package}/__init__.py",
+        )
         entry_name = "main.py" if profile_name == "fastapi" else "__main__.py"
-        runner.write(pkg_dir / entry_name,
-                     entry_module_content(profile_name, package),
-                     f"Creating src/{package}/{entry_name}")
+        runner.write(
+            pkg_dir / entry_name,
+            entry_module_content(profile_name, package),
+            f"Creating src/{package}/{entry_name}",
+        )
+    else:
+        runner.write(
+            target / "main.py",
+            main_module_content(project, profile_name),
+            "Creating main.py",
+        )
 
-    runner.write(target / "tests" / "test_smoke.py",
-                 sample_test_content(package, profile.src_layout),
-                 "Creating tests/test_smoke.py")
+    runner.write(
+        target / "tests" / "test_smoke.py",
+        sample_test_content(package, profile_name),
+        "Creating tests/test_smoke.py",
+    )
 
-    today = datetime.date.today().isoformat()
     for extra in profile.extras:
-        content = {"EXPERIMENT_LOG.md": EXPERIMENT_LOG.format(date=today),
-                   "CLAIMS.md": CLAIMS_REGISTRY}[extra]
+        content = {
+            "EXPERIMENT_LOG.md": EXPERIMENT_LOG,
+            "CLAIMS.md": CLAIMS_REGISTRY,
+        }[extra]
         runner.write(target / extra, content, f"Writing {extra}")
 
 
-def setup_environment(runner: Runner, target: Path, venv_name: str,
-                      skip_install: bool) -> None:
+def setup_environment(
+    runner: Runner, target: Path, venv_name: str, skip_install: bool
+) -> None:
+    """Create the environment, install the project, and capture a resolved lock."""
     venv_dir = target / venv_name
     if venv_dir.exists():
         print(f"  -- Virtual environment exists ({venv_name}/), reusing it")
     else:
-        runner.run([sys.executable, "-m", "venv", str(venv_dir)],
-                   f"Creating virtual environment ({venv_name}/)", cwd=target)
+        runner.run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            f"Creating virtual environment ({venv_name}/)",
+            cwd=target,
+        )
     if skip_install:
         print("  -- Skipping dependency install (--skip-install)")
         return
     python = venv_python(venv_dir)
-    runner.run([str(python), "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
-               "Upgrading pip", cwd=target)
-    runner.run([str(python), "-m", "pip", "install", "-r", "requirements.txt",
-                "--quiet"],
-               "Installing profile dependencies", cwd=target)
+    runner.run(
+        [str(python), "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+        "Upgrading pip",
+        cwd=target,
+    )
+    lock_path = target / "requirements.lock"
+    use_existing_lock = lock_path.is_file() and not runner.force
+    requirement_file = (
+        "requirements.lock" if use_existing_lock else "requirements-dev.txt"
+    )
+    runner.run(
+        [str(python), "-m", "pip", "install", "-r", requirement_file, "--quiet"],
+        f"Installing dependencies from {requirement_file}",
+        cwd=target,
+    )
+    runner.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--editable",
+            ".",
+            "--quiet",
+        ],
+        "Installing the generated project in editable mode",
+        cwd=target,
+    )
+    if use_existing_lock:
+        print("  -- Existing requirements.lock preserved and used")
+        return
+
+    frozen = runner.capture(
+        [str(python), "-m", "pip", "freeze", "--local", "--exclude-editable"],
+        "Resolving requirements.lock from the installed environment",
+        cwd=target,
+    )
+    lock_content = ""
+    if frozen is not None:
+        lock_lines = sorted(
+            (line.strip() for line in frozen.splitlines() if line.strip()),
+            key=str.casefold,
+        )
+        lock_content = "\n".join(lock_lines) + ("\n" if lock_lines else "")
+    runner.write(lock_path, lock_content, "Writing resolved requirements.lock")
 
 
 def git_identity_ready(target: Path) -> bool:
     """True when git has a user.name and user.email available for commits."""
+    if all(
+        os.environ.get(name)
+        for name in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        )
+    ):
+        return True
+    existing_repository = (target / ".git").exists()
     for key in ("user.name", "user.email"):
-        probe = subprocess.run(["git", "config", "--get", key], cwd=str(target),
-                               text=True, capture_output=True)
+        command = ["git", "config"]
+        if not existing_repository:
+            command.append("--global")
+        command.extend(("--get", key))
+        try:
+            probe = subprocess.run(
+                command,
+                cwd=str(target) if target.is_dir() else None,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
         if probe.returncode != 0 or not probe.stdout.strip():
             return False
     return True
 
 
-def setup_git(runner: Runner, target: Path, remote_url: Optional[str],
-              create_remote: bool, push: bool) -> None:
+def has_origin(target: Path) -> bool:
+    """Return whether an existing independent repository has an origin."""
+    if not (target / ".git").exists():
+        return False
+    try:
+        probe = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(target),
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
+def gh_authenticated() -> bool:
+    """Return whether GitHub CLI has a usable github.com authentication context."""
+    try:
+        probe = subprocess.run(
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def validate_venv_name(venv_name: str) -> None:
+    """Reject virtual-environment names that can escape or alias the project root."""
+    windows_stem = venv_name.split(".", 1)[0].casefold()
+    if (
+        not venv_name
+        or venv_name in (".", "..")
+        or re.fullmatch(r"[A-Za-z0-9._-]+", venv_name) is None
+        or windows_stem in WINDOWS_RESERVED_NAMES
+    ):
+        raise ValueError(
+            "--venv-name must be one safe directory name using letters, numbers, "
+            "'.', '_', or '-'"
+        )
+
+
+def validate_run_preflight(
+    target: Path,
+    remote_url: str | None,
+    *,
+    dry_run: bool,
+    commit: bool,
+    create_remote: bool,
+    push: bool,
+    pre_commit: bool = False,
+    skip_venv: bool = False,
+    venv_name: str = ".venv",
+    constitution_enabled: bool = True,
+) -> None:
+    """Reject impossible requests before RepoForge writes any project file."""
+    if target.exists() and not target.is_dir():
+        raise ValueError(f"Target exists and is not a directory: {target}")
+    validate_venv_name(venv_name)
+    if constitution_enabled and (target / "law" / "AGENTS-Constitution").exists():
+        raise ValueError(
+            "A retired vendored law tree remains at law/AGENTS-Constitution. "
+            "Preserve and migrate it explicitly before enabling the pointer; "
+            "--force will not delete it. --no-constitution opts out without "
+            "removing or validating the existing tree."
+        )
+    origin_exists = has_origin(target)
+    if push and not commit:
+        raise ValueError(
+            "--push requires the default initial commit; remove --no-commit"
+        )
+    if create_remote and not remote_url and not origin_exists:
+        raise ValueError("--create-remote requires a repository name or --repo-url")
+    if push and not remote_url and not origin_exists:
+        raise ValueError(
+            "--push requires a repository name, --repo-url, or existing origin"
+        )
+    if (
+        create_remote
+        and remote_url
+        and not origin_exists
+        and github_slug_from_remote(remote_url) is None
+    ):
+        raise ValueError("--create-remote supports GitHub HTTPS or SSH remotes only")
+    if pre_commit and skip_venv and not venv_python(target / venv_name).is_file():
+        raise ValueError(
+            "--pre-commit with --skip-venv requires an existing virtual environment"
+        )
+    if dry_run:
+        return
+    if shutil.which("git") is None:
+        raise ValueError("git is required but was not found on PATH")
+    if commit and not git_identity_ready(target):
+        raise ValueError(
+            "git user.name/user.email are required for the initial commit; "
+            "configure them or pass --no-commit"
+        )
+    if create_remote and not origin_exists:
+        if shutil.which("gh") is None:
+            raise ValueError("--create-remote requires the GitHub gh CLI")
+        if not gh_authenticated():
+            raise ValueError(
+                "--create-remote requires an authenticated gh session for github.com"
+            )
+
+
+def generated_git_pathspecs(runner: Runner, target: Path) -> list[str]:
+    """Return unique, project-relative pathspecs for files generated this run."""
+    root = target.resolve()
+    pathspecs: list[str] = []
+    for path in runner.stage_paths:
+        checked = runner.checked_path(path).resolve()
+        try:
+            relative = checked.relative_to(root).as_posix()
+        except ValueError as error:
+            raise ValueError(f"Generated path escaped project root: {path}") from error
+        if relative not in pathspecs:
+            pathspecs.append(relative)
+    return pathspecs
+
+
+def setup_git(
+    runner: Runner,
+    target: Path,
+    remote_url: str | None,
+    create_remote: bool,
+    push: bool,
+    commit: bool,
+) -> None:
     if (target / ".git").exists():
         print("  -- Git repository exists, reusing it")
     else:
         runner.run(["git", "init"], "Initializing git repository", cwd=target)
-        runner.run(["git", "branch", "-M", "main"], "Setting primary branch to main",
-                   cwd=target)
+        runner.run(
+            ["git", "branch", "-M", "main"],
+            "Setting primary branch to main",
+            cwd=target,
+        )
 
-    runner.run(["git", "add", "."], "Staging files", cwd=target)
-
-    if runner.dry_run:
-        runner.run(["git", "commit", "-m", "Initial commit (RepoForge)"],
-                   "Creating initial commit", cwd=target)
-    else:
-        staged = subprocess.run(["git", "diff", "--cached", "--quiet"],
-                                cwd=str(target))
-        if staged.returncode == 0:
-            print("  -- Nothing new to commit")
-        elif not git_identity_ready(target):
-            print("  !! git user.name/user.email not configured — skipping commit.")
-            print('     Fix: git config --global user.name "You" && '
-                  'git config --global user.email "you@example.com"')
+    pathspecs = generated_git_pathspecs(runner, target)
+    if not commit:
+        print(
+            "  -- Initial commit disabled (--no-commit); "
+            "generated files remain unstaged"
+        )
+    elif pathspecs:
+        runner.run(
+            ["git", "add", "--", *pathspecs],
+            f"Staging {len(pathspecs)} generated path(s)",
+            cwd=target,
+        )
+        if runner.dry_run:
+            runner.run(
+                ["git", "commit", "-m", "Initial commit (RepoForge)", "--", *pathspecs],
+                "Creating initial commit",
+                cwd=target,
+            )
         else:
-            runner.run(["git", "commit", "-m", "Initial commit (RepoForge)"],
-                       "Creating initial commit", cwd=target)
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--", *pathspecs],
+                cwd=str(target),
+                check=False,
+            )
+            if staged.returncode == 0:
+                print("  -- Nothing generated is staged for commit")
+            else:
+                runner.run(
+                    [
+                        "git",
+                        "commit",
+                        "-m",
+                        "Initial commit (RepoForge)",
+                        "--",
+                        *pathspecs,
+                    ],
+                    "Creating initial commit",
+                    cwd=target,
+                )
+    else:
+        print("  -- No generated files to stage")
 
     if not remote_url:
         print("  -- No remote requested (pass a repo name or --repo-url to add one)")
         return
 
-    has_origin = subprocess.run(["git", "remote", "get-url", "origin"],
-                                cwd=str(target), capture_output=True
-                                ).returncode == 0 if not runner.dry_run else False
-    if has_origin:
+    origin_exists = has_origin(target) if not runner.dry_run else False
+    if origin_exists:
         print("  -- Remote 'origin' already configured, leaving it as is")
+        if push:
+            runner.run(
+                ["git", "push", "-u", "origin", "HEAD"],
+                "Pushing current branch to origin",
+                cwd=target,
+            )
         return
 
-    if create_remote and shutil.which("gh"):
-        slug = remote_url.removeprefix("https://github.com/").removesuffix(".git")
-        command = ["gh", "repo", "create", slug, "--private", "--source", ".",
-                   "--remote", "origin"]
+    if create_remote:
+        slug = github_slug_from_remote(remote_url)
+        if slug is None:
+            raise ValueError("Unable to derive a GitHub owner/repository slug")
+        command = [
+            "gh",
+            "repo",
+            "create",
+            slug,
+            "--private",
+            "--source",
+            ".",
+            "--remote",
+            "origin",
+        ]
         if push:
             command.append("--push")
-        made = runner.run(command, f"Creating GitHub repo {slug} via gh CLI",
-                          cwd=target, fatal=False)
-        if made:
-            return
-        print("     Falling back to plain remote add.")
-    elif create_remote:
-        print("  -- gh CLI not found; adding remote without creating the GitHub repo")
+        runner.run(command, f"Creating GitHub repo {slug} via gh CLI", cwd=target)
+        return
 
-    runner.run(["git", "remote", "add", "origin", remote_url],
-               f"Linking remote {remote_url}", cwd=target)
+    runner.run(
+        ["git", "remote", "add", "origin", remote_url],
+        f"Linking remote {remote_url}",
+        cwd=target,
+    )
     if push:
-        runner.run(["git", "push", "-u", "origin", "main"], "Pushing to origin",
-                   cwd=target, fatal=False)
+        runner.run(
+            ["git", "push", "-u", "origin", "HEAD"],
+            "Pushing current branch to origin",
+            cwd=target,
+        )
 
 
 def setup_pre_commit(runner: Runner, target: Path, venv_name: str) -> None:
-    runner.write(target / ".pre-commit-config.yaml", PRE_COMMIT_CONFIG,
-                 "Writing .pre-commit-config.yaml")
+    """Write the hook contract and install the pinned pre-commit runner."""
+    runner.write(
+        target / ".pre-commit-config.yaml",
+        PRE_COMMIT_CONFIG,
+        "Writing .pre-commit-config.yaml",
+    )
     python = venv_python(target / venv_name)
-    if runner.dry_run or python.exists():
-        runner.run([str(python), "-m", "pip", "install", "pre-commit", "--quiet"],
-                   "Installing pre-commit into the venv", cwd=target, fatal=False)
-        runner.run([str(python), "-m", "pre_commit", "install"],
-                   "Activating pre-commit hooks", cwd=target, fatal=False)
-    else:
-        print("  -- venv missing; run 'pre-commit install' after creating one")
+    if not runner.dry_run and not python.is_file():
+        raise ValueError(
+            "Virtual-environment Python is missing; cannot install pre-commit: "
+            f"{python}"
+        )
+    runner.run(
+        [str(python), "-m", "pip", "install", PRE_COMMIT_REQUIREMENT, "--quiet"],
+        f"Installing {PRE_COMMIT_REQUIREMENT} into the venv",
+        cwd=target,
+    )
+
+
+def activate_pre_commit(runner: Runner, target: Path, venv_name: str) -> None:
+    """Activate hooks after Git has committed the generated hook configuration."""
+    python = venv_python(target / venv_name)
+    runner.run(
+        [str(python), "-m", "pre_commit", "install"],
+        "Activating pre-commit hooks",
+        cwd=target,
+    )
 
 
 # --------------------------------------------------------------------------- #
 # CLI.                                                                        #
 # --------------------------------------------------------------------------- #
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     defaults = load_defaults()
     parser = argparse.ArgumentParser(
         prog="repoforge",
-        description="Bootstrap a production-ready Python project in one command.",
+        description=(
+            "Bootstrap a production-ready Python project foundation in one command."
+        ),
         epilog="Profiles: " + ", ".join(PROFILES) + ".  "
-               "Use --list-profiles for details.",
+        "Use --list-profiles for details.",
     )
-    parser.add_argument("repo_name", nargs="?",
-                        help="Repo slug (my-tool), owner/slug, or full git URL. "
-                             "Omit to skip the remote.")
+    parser.add_argument(
+        "repo_name",
+        nargs="?",
+        help="Repo slug (my-tool), owner/slug, or full git URL. "
+        "Omit to skip the remote.",
+    )
     parser.add_argument("--repo-url", help="Explicit remote URL (overrides repo_name).")
-    parser.add_argument("--directory", "-d", default=".",
-                        help="Target directory (default: current directory).")
-    parser.add_argument("--profile", "-p", default=defaults.get("profile", "general"),
-                        choices=sorted(PROFILES),
-                        help="Project profile (default: %(default)s).")
-    parser.add_argument("--owner", default=defaults.get("owner"),
-                        help="GitHub owner used to expand bare repo slugs.")
-    parser.add_argument("--author", default=defaults.get("author"),
-                        help="Name used in the LICENSE file.")
-    parser.add_argument("--license", default=defaults.get("license", "mit"),
-                        choices=["mit", "none"],
-                        help="License to scaffold (default: %(default)s).")
-    parser.add_argument("--venv-name", default=".venv",
-                        help="Virtual environment directory name.")
-    parser.add_argument("--skip-venv", action="store_true",
-                        help="Skip virtual environment creation.")
-    parser.add_argument("--skip-install", action="store_true",
-                        help="Create the venv but skip installing dependencies.")
-    parser.add_argument("--pre-commit", action="store_true",
-                        help="Scaffold and install pre-commit hooks (ruff + black).")
-    parser.add_argument("--create-remote", action="store_true",
-                        help="Create the GitHub repository via the gh CLI.")
-    parser.add_argument("--push", action="store_true",
-                        help="Push the initial commit to origin.")
-    parser.add_argument("--force", action="store_true",
-                        help="Overwrite files RepoForge would otherwise leave alone.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print the full plan without changing anything.")
-    parser.add_argument("--constitution",
-                        default=defaults.get("constitution_path"),
-                        metavar="PATH",
-                        help="Path to an AGENTS Constitution pack root "
-                             "(AGENTS.md + PACK.md + VERSION + SOP.md). "
-                             "Also: REPOFORGE_CONSTITUTION env or saved default.")
-    parser.add_argument("--constitution-vendor", action="store_true",
-                        help="Copy the constitution pack into "
-                             "law/AGENTS-Constitution/ (self-contained project).")
-    parser.add_argument("--no-constitution", action="store_true",
-                        help="Do not attach AGENTS Constitution "
-                             "(even if a pack is discoverable).")
-    parser.add_argument("--save-defaults", action="store_true",
-                        help="Remember --owner/--author/--license/--profile/"
-                             "--constitution in ~/.repoforge.json.")
-    parser.add_argument("--list-profiles", action="store_true",
-                        help="Show all profiles and exit.")
-    parser.add_argument("--version", action="version",
-                        version=f"RepoForge {__version__}")
+    parser.add_argument(
+        "--directory",
+        "-d",
+        default=".",
+        help="Target directory (default: current directory).",
+    )
+    parser.add_argument(
+        "--profile",
+        "-p",
+        default=defaults.get("profile", "general"),
+        choices=sorted(PROFILES),
+        help="Project profile (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--owner",
+        default=defaults.get("owner"),
+        help="GitHub owner used to expand bare repo slugs.",
+    )
+    parser.add_argument(
+        "--author",
+        default=defaults.get("author"),
+        help="Name used in the LICENSE file.",
+    )
+    parser.add_argument(
+        "--license",
+        default=defaults.get("license", "mit"),
+        choices=["mit", "none"],
+        help="License to scaffold (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--venv-name", default=".venv", help="Virtual environment directory name."
+    )
+    parser.add_argument(
+        "--skip-venv", action="store_true", help="Skip virtual environment creation."
+    )
+    parser.add_argument(
+        "--skip-install",
+        action="store_true",
+        help="Create the venv but skip installing dependencies.",
+    )
+    parser.add_argument(
+        "--pre-commit",
+        action="store_true",
+        help="Scaffold and install pre-commit hooks (ruff + black).",
+    )
+    parser.add_argument(
+        "--create-remote",
+        action="store_true",
+        help="Create the GitHub repository via the gh CLI.",
+    )
+    parser.add_argument(
+        "--push", action="store_true", help="Push the initial commit to origin."
+    )
+    parser.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="Initialize Git but leave generated files unstaged and uncommitted.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite files RepoForge would otherwise leave alone.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the full plan without changing anything.",
+    )
+    parser.add_argument(
+        "--constitution",
+        metavar="PATH",
+        help="Retired local-pack selector; remove it to use the canonical pointer.",
+    )
+    parser.add_argument(
+        "--constitution-vendor",
+        action="store_true",
+        help="Retired; editable law vendoring is rejected before writes.",
+    )
+    parser.add_argument(
+        "--no-constitution",
+        action="store_true",
+        help="Do not create a WPAI Constitution pointer; ignore stale path settings.",
+    )
+    parser.add_argument(
+        "--save-defaults",
+        action="store_true",
+        help="Remember --owner/--author/--license/--profile in ~/.repoforge.json.",
+    )
+    parser.add_argument(
+        "--list-profiles", action="store_true", help="Show all profiles and exit."
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"RepoForge {__version__}"
+    )
+    parser.set_defaults(saved_constitution_path=defaults.get(RETIRED_CONFIG_KEY))
     return parser.parse_args(argv)
 
 
@@ -893,21 +1406,38 @@ def list_profiles() -> None:
         print(f"  {'':<{width}}  packages: {', '.join(profile.packages)}\n")
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
+    if sys.version_info < MINIMUM_PYTHON:
+        required = ".".join(str(part) for part in MINIMUM_PYTHON)
+        print(f"Error: RepoForge {__version__} requires Python {required} or newer")
+        sys.exit(2)
+
     args = parse_args(argv)
+    constitution_enabled = not args.no_constitution
+    try:
+        validate_constitution_options(
+            args.constitution,
+            vendor=args.constitution_vendor,
+            enabled=constitution_enabled,
+            saved_path=args.saved_constitution_path,
+        )
+    except ValueError as error:
+        print(f"Error: {error}")
+        sys.exit(2)
 
     if args.list_profiles:
+        if args.save_defaults:
+            save_defaults(
+                {
+                    "owner": args.owner,
+                    "author": args.author,
+                    "license": args.license,
+                    "profile": args.profile,
+                },
+                dry_run=args.dry_run,
+            )
         list_profiles()
         return
-
-    if args.save_defaults:
-        save_defaults({
-            "owner": args.owner,
-            "author": args.author,
-            "license": args.license,
-            "profile": args.profile,
-            "constitution_path": args.constitution,
-        })
 
     try:
         remote_url = build_remote_url(args.repo_name, args.repo_url, args.owner)
@@ -916,35 +1446,54 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(2)
 
     target = Path(args.directory).resolve()
-    project = args.repo_name.split("/")[-1].removesuffix(".git") \
-        if args.repo_name and not args.repo_name.startswith(("http", "git@")) \
+    project = (
+        args.repo_name.split("/")[-1].removesuffix(".git")
+        if args.repo_name and not args.repo_name.startswith(REMOTE_URL_PREFIXES)
         else target.name
-
-    constitution_enabled = not args.no_constitution
-    pack_root: Optional[Path] = None
-    if constitution_enabled:
-        pack_root = discover_constitution_pack(
-            args.constitution,
-            start=Path(__file__).resolve().parent,
+    )
+    if not project.strip():
+        print(
+            "Error: Unable to derive a project name; pass a repo name or "
+            "target directory"
         )
-        if args.constitution and pack_root is None:
-            print(f"Error: --constitution path is not a valid AGENTS Constitution pack: "
-                  f"{args.constitution}")
-            print("       Expected files at pack root: "
-                  + ", ".join(CONSTITUTION_MARKERS))
-            sys.exit(2)
+        sys.exit(2)
 
-    runner = Runner(dry_run=args.dry_run, force=args.force)
+    try:
+        validate_run_preflight(
+            target,
+            remote_url,
+            dry_run=args.dry_run,
+            commit=not args.no_commit,
+            create_remote=args.create_remote,
+            push=args.push,
+            pre_commit=args.pre_commit,
+            skip_venv=args.skip_venv,
+            venv_name=args.venv_name,
+            constitution_enabled=constitution_enabled,
+        )
+    except ValueError as error:
+        print(f"Error: {error}")
+        sys.exit(2)
+
+    if args.save_defaults:
+        save_defaults(
+            {
+                "owner": args.owner,
+                "author": args.author,
+                "license": args.license,
+                "profile": args.profile,
+            },
+            dry_run=args.dry_run,
+        )
+
+    runner = Runner(dry_run=args.dry_run, force=args.force, root=target)
     mode = " (dry run)" if args.dry_run else ""
     print(f"RepoForge {__version__}{mode}")
     print(f"Project:   {project}  [{args.profile}]")
     print(f"Directory: {target}")
     print(f"Remote:    {remote_url or '(none)'}")
-    if constitution_enabled and pack_root:
-        mode_c = "vendor" if args.constitution_vendor else "pointer"
-        print(f"Constitution: {pack_root}  [{mode_c}]")
-    elif constitution_enabled:
-        print("Constitution: (not found — will skip; pass --constitution PATH)")
+    if constitution_enabled:
+        print(f"Constitution: {CONSTITUTION_SOURCE}  [pointer only]")
     else:
         print("Constitution: disabled")
     print()
@@ -952,45 +1501,83 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not args.dry_run:
         target.mkdir(parents=True, exist_ok=True)
 
-    print("[1/5] Scaffolding")
-    scaffold_project(runner, target, project, args.profile, args.license,
-                     args.author or "")
-
-    print("\n[2/5] AGENTS Constitution")
-    setup_constitution(
+    print("[1/6] Scaffolding")
+    scaffold_project(
         runner,
         target,
         project,
-        pack_root,
-        vendor=args.constitution_vendor,
+        args.profile,
+        args.license,
+        args.author or "",
+        pre_commit=args.pre_commit,
+    )
+
+    print("\n[2/6] WPAI Constitution")
+    pointer_installed = setup_constitution(
+        runner,
+        target,
         enabled=constitution_enabled,
     )
 
-    print("\n[3/5] Environment")
+    print("\n[3/6] Environment")
     if args.skip_venv:
         print("  -- Skipping virtual environment (--skip-venv)")
     else:
         setup_environment(runner, target, args.venv_name, args.skip_install)
 
-    print("\n[4/5] Git")
-    setup_git(runner, target, remote_url, args.create_remote, args.push)
-
-    print("\n[5/5] Quality hooks")
+    print("\n[4/6] Quality configuration")
     if args.pre_commit:
         setup_pre_commit(runner, target, args.venv_name)
     else:
         print("  -- Pre-commit not requested (add --pre-commit to enable)")
 
+    print("\n[5/6] Git")
+    setup_git(
+        runner,
+        target,
+        remote_url,
+        args.create_remote,
+        args.push,
+        commit=not args.no_commit,
+    )
+
+    print("\n[6/6] Quality hook activation")
+    if args.pre_commit:
+        activate_pre_commit(runner, target, args.venv_name)
+    else:
+        print("  -- No hooks to activate")
+
     print(f"\n[SUCCESS] {project} is ready{mode}.")
     if runner.skipped:
-        print(f"Left untouched (already existed): {len(runner.skipped)} file(s). "
-              f"Use --force to overwrite.")
-    activate = f"{args.venv_name}\\Scripts\\activate" if sys.platform == "win32" \
+        print(
+            f"Left untouched (already existed): {len(runner.skipped)} file(s). "
+            f"Use --force to overwrite."
+        )
+    activate = (
+        f"{args.venv_name}\\Scripts\\activate"
+        if sys.platform == "win32"
         else f"source {args.venv_name}/bin/activate"
-    print(f"Next: cd {target}  &&  {activate}  &&  pytest")
-    if constitution_enabled and pack_root and not args.constitution_vendor:
-        print("       AI agents: load this project's AGENTS.md → constitution pack.")
+    )
+    if args.skip_venv:
+        print(
+            f"Next: cd {target} and create an environment, install "
+            "requirements-dev.txt, install the project editable, then run pytest"
+        )
+    elif args.skip_install:
+        print(
+            f"Next: cd {target}  &&  {activate}  &&  "
+            "python -m pip install -r requirements-dev.txt  &&  "
+            "python -m pip install --no-deps --editable .  &&  pytest"
+        )
+    else:
+        print(f"Next: cd {target}  &&  {activate}  &&  pytest")
+    if pointer_installed:
+        print("       AI agents: verify accepted WPAI Constitution via AGENTS.md.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        print(f"Error: {error}")
+        sys.exit(1)

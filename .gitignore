@@ -4,7 +4,7 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-RepoForge-Pro-v1.0.zip
+RepoForge-Pro-v*.zip
 
 # Local credentials and editor state.
 .env
